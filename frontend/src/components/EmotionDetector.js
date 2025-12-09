@@ -7,8 +7,7 @@ import React, {
 import axios from 'axios';
 import './EmotionDetector.css';
 
-const API_BASE_URL =
-  process.env.REACT_APP_API_BASE_URL || 'http://localhost:5000';
+const API_BASE_URL = 'https://emotions-tt57.onrender.com' || 'http://localhost:5000' ;
 
 
 /* ----------------------------- Helper functions ----------------------------- */
