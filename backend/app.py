@@ -1,152 +1,112 @@
+import os
+import numpy as np
+import cv2
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import cv2
-import numpy as np
-import base64
-from io import BytesIO
-from PIL import Image
-import os
-import threading
 
 app = Flask(__name__)
 CORS(app)
 
+# Path to the saved Keras model
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "facialemotionmodel.h5")
 
-# Single source of truth: if model is not None, it's loaded
+EMOTIONS = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
+
+# Global model reference (lazy-loaded)
 model = None
 
-# Haar cascade for face detection
-haar_file = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-face_cascade = cv2.CascadeClassifier(haar_file)
 
-EMOTION_LABELS = {
-    0: "angry",
-    1: "disgust",
-    2: "fear",
-    3: "happy",
-    4: "neutral",
-    5: "sad",
-    6: "surprise",
-}
-
-
-def load_model(force: bool = False):
+def load_model():
     """
-    Load the emotion detection model.
-    - If force=False and model is already loaded, do nothing.
-    - If anything fails, just print the error; caller decides what to return.
+    Lazily load the Keras model the first time it's needed.
+    Do NOT call this from /api/health.
     """
     global model
-
-    if model is not None and not force:
-        return
+    if model is not None:
+        return model
 
     try:
         from tensorflow import keras
 
-        model_path = os.path.join(BASE_DIR, "facialemotionmodel.h5")
-        model = keras.models.load_model(model_path)
-        print(f"✓ Model loaded from {model_path}")
+        print(f"Loading model from {MODEL_PATH} ...", flush=True)
+        model = keras.models.load_model(MODEL_PATH, compile=False)
+        print(f"✓ Model loaded from {MODEL_PATH}", flush=True)
     except Exception as e:
-        # Do NOT set model back to None here; just log the error
-        print(f"Error loading model: {e}")
+        # Log the error; keep model as None so endpoints can return 500
+        print(f"✗ Failed to load model: {e}", flush=True)
+        model = None
+
+    return model
 
 
-# Start model loading in the background once this module is imported
-threading.Thread(target=load_model, daemon=True).start()
-
-
-def extract_features(image):
-    """Prepare image for the model (expects a 48x48 grayscale np array)."""
-    feature = np.array(image).reshape(1, 48, 48, 1)
-    return feature / 255.0
-
-
-def process_frame(frame):
-    """Detect faces and predict emotions on a single BGR frame."""
-    # If model is not ready yet, try to load it once (synchronously)
-    if model is None:
-        load_model()
-
-    if model is None:
-        return {"error": "Model not loaded yet. Try again in a few seconds."}
-
-    try:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-
-        emotions_found = []
-
-        for (x, y, w, h) in faces:
-            face_roi = gray[y : y + h, x : x + w]
-            face_roi = cv2.resize(face_roi, (48, 48))
-
-            features = extract_features(face_roi)
-            prediction = model.predict(features, verbose=0)
-
-            idx = int(np.argmax(prediction))
-            emotion = EMOTION_LABELS[idx]
-            confidence = float(prediction[0][idx])
-
-            emotions_found.append(
-                {
-                    "emotion": emotion,
-                    "confidence": confidence,
-                    "x": int(x),
-                    "y": int(y),
-                    "width": int(w),
-                    "height": int(h),
-                }
-            )
-
-        return {"faces_count": len(faces), "emotions": emotions_found}
-
-    except Exception as e:
-        return {"error": f"Detection failed: {str(e)}"}
-
-
-@app.route("/api/detect-emotion", methods=["POST"])
-def detect_emotion_endpoint():
-    """API endpoint for receiving image and returning predicted emotion."""
-    try:
-        data = request.json or {}
-        image_field = data.get("image", "")
-
-        if "," in image_field:
-            image_data = image_field.split(",", 1)[1]
-        else:
-            image_data = image_field
-
-        # base64 → PIL → numpy → OpenCV BGR
-        image = Image.open(BytesIO(base64.b64decode(image_data)))
-        frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-
-        result = process_frame(frame)
-        return jsonify(result)
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+@app.route("/")
+def index():
+    return "Emotion detection backend running", 200
 
 
 @app.route("/api/health", methods=["GET"])
 def health():
     """
-    Health check endpoint.
-    We also *attempt* to load the model here if it's not ready yet,
-    so hitting this URL can help "warm up" a worker.
+    health check for Render.
+    IMPORTANT: Do NOT load the model here.
+    Render calls this very frequently; loading TF here kills the worker.
     """
-    if model is None:
-        load_model()
-
     return jsonify(
         {
             "status": "ok",
+            "emotions_supported": EMOTIONS,
             "model_loaded": model is not None,
-            "emotions_supported": list(EMOTION_LABELS.values()),
+        }
+    )
+
+
+@app.route("/api/detect", methods=["POST"])
+def detect():
+    """
+    Main prediction endpoint. This is where we lazy-load the model.
+    """
+    mdl = load_model()
+    if mdl is None:
+        return jsonify({"error": "Model not loaded on server"}), 500
+
+    if "image" not in request.files:
+        return jsonify({"error": "No image file provided under 'image' field"}), 400
+
+    file = request.files["image"]
+    image_bytes = file.read()
+
+    # Decode image using OpenCV
+    np_arr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return jsonify({"error": "Could not decode image"}), 400
+
+    # Convert to grayscale + resize to 48x48 (like training)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    face = cv2.resize(gray, (48, 48))
+    face = face.astype("float32") / 255.0
+    face = np.expand_dims(face, axis=(0, -1))  # shape: (1, 48, 48, 1)
+
+    # Predict
+    preds = mdl.predict(face)[0]  # shape: (7,)
+    top_idx = int(np.argmax(preds))
+    top_emotion = EMOTIONS[top_idx]
+    top_conf = float(preds[top_idx])
+
+    probs = {EMOTIONS[i]: float(preds[i]) for i in range(len(EMOTIONS))}
+
+    return jsonify(
+        {
+            "emotion": top_emotion,
+            "confidence": top_conf,
+            "probabilities": probs,
         }
     )
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000, threaded=True)
+    # For local testing
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=True)
