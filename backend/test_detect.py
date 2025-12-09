@@ -9,7 +9,7 @@ b64 = base64.b64encode(buf.getvalue()).decode()
 dataurl = 'data:image/jpeg;base64,' + b64
 
 payload = json.dumps({'image': dataurl}).encode('utf-8')
-req = urllib.request.Request('https://emotions-tt57.onrender.com/api/detect-emotion', data=payload, headers={'Content-Type':'application/json'})
+req = urllib.request.Request('http://localhost:5000/api/detect-emotion', data=payload, headers={'Content-Type':'application/json'})
 try:
     with urllib.request.urlopen(req, timeout=10) as resp:
         print('STATUS', resp.status)

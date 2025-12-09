@@ -11,39 +11,15 @@ import threading
 app = Flask(__name__)
 CORS(app)
 
-# Base directory for model path
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Single source of truth: if model is not None, it's loaded
 model = None
-model_loaded = False
 
-
-def load_model():
-    """Load the emotion detection model asynchronously"""
-    global model, model_loaded
-    if model_loaded:
-        return
-    try:
-        from tensorflow import keras
-
-        model_path = os.path.join(BASE_DIR, "facialemotionmodel.h5")
-        model = keras.models.load_model(model_path)
-        print(f"✓ Model loaded from {model_path}")
-        model_loaded = True
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        # mark as loaded to avoid infinite "model not loaded yet" loop
-        model_loaded = True
-
-
-# Start model loading in background
-threading.Thread(target=load_model, daemon=True).start()
-
-# Haar cascade
+# Haar cascade for face detection
 haar_file = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 face_cascade = cv2.CascadeClassifier(haar_file)
 
-# Label mapping must match your training
 EMOTION_LABELS = {
     0: "angry",
     1: "disgust",
@@ -55,14 +31,44 @@ EMOTION_LABELS = {
 }
 
 
+def load_model(force: bool = False):
+    """
+    Load the emotion detection model.
+    - If force=False and model is already loaded, do nothing.
+    - If anything fails, just print the error; caller decides what to return.
+    """
+    global model
+
+    if model is not None and not force:
+        return
+
+    try:
+        from tensorflow import keras
+
+        model_path = os.path.join(BASE_DIR, "facialemotionmodel.h5")
+        model = keras.models.load_model(model_path)
+        print(f"✓ Model loaded from {model_path}")
+    except Exception as e:
+        # Do NOT set model back to None here; just log the error
+        print(f"Error loading model: {e}")
+
+
+# Start model loading in the background once this module is imported
+threading.Thread(target=load_model, daemon=True).start()
+
+
 def extract_features(image):
-    """Prepare 48x48 grayscale image for the model"""
+    """Prepare image for the model (expects a 48x48 grayscale np array)."""
     feature = np.array(image).reshape(1, 48, 48, 1)
     return feature / 255.0
 
 
 def process_frame(frame):
-    """Detect faces and predict emotions on a single BGR frame"""
+    """Detect faces and predict emotions on a single BGR frame."""
+    # If model is not ready yet, try to load it once (synchronously)
+    if model is None:
+        load_model()
+
     if model is None:
         return {"error": "Model not loaded yet. Try again in a few seconds."}
 
@@ -102,14 +108,15 @@ def process_frame(frame):
 
 @app.route("/api/detect-emotion", methods=["POST"])
 def detect_emotion_endpoint():
-    """API endpoint for receiving image and returning predicted emotion"""
+    """API endpoint for receiving image and returning predicted emotion."""
     try:
         data = request.json or {}
-        image_data = data.get("image", "")
+        image_field = data.get("image", "")
 
-        if "," in image_data:
-            # strip data URL prefix if present
-            image_data = image_data.split(",", 1)[1]
+        if "," in image_field:
+            image_data = image_field.split(",", 1)[1]
+        else:
+            image_data = image_field
 
         # base64 → PIL → numpy → OpenCV BGR
         image = Image.open(BytesIO(base64.b64decode(image_data)))
@@ -124,22 +131,22 @@ def detect_emotion_endpoint():
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    """Health check endpoint"""
+    """
+    Health check endpoint.
+    We also *attempt* to load the model here if it's not ready yet,
+    so hitting this URL can help "warm up" a worker.
+    """
+    if model is None:
+        load_model()
+
     return jsonify(
         {
             "status": "ok",
-            "model_loaded": model_loaded,
+            "model_loaded": model is not None,
             "emotions_supported": list(EMOTION_LABELS.values()),
         }
     )
 
 
 if __name__ == "__main__":
-    # Local run (Render / gunicorn will ignore this and use `gunicorn app:app`)
-    port = int(os.environ.get("PORT", 5000))
-    app.run(
-        debug=True,
-        host="0.0.0.0",
-        port=port,
-        threaded=True,
-    )
+    app.run(debug=True, host="0.0.0.0", port=5000, threaded=True)
